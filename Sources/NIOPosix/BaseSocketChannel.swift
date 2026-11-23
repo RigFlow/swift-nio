@@ -1246,7 +1246,11 @@ class BaseSocketChannel<SocketType: BaseSocketProtocol>: SelectableChannel, Chan
         // The only way to avoid that race, would be to use heavy handed synchronisation primitives like IOSQE_IO_DRAIN (basically
         // flushing all pending requests and wait for a fake event result to sync up) which would be awful for performance,
         // so better skip the assert() for io_uring instead.
-        #if !SWIFTNIO_USE_IO_URING
+        //
+        // WSAPoll gives no such guarantee either: it reports a listening
+        // socket readable for a connection that was reset before it could
+        // be accepted, and `accept` then finds nothing (WSAEWOULDBLOCK).
+        #if !SWIFTNIO_USE_IO_URING && !os(Windows)
         assert(readResult == .some)
         #endif
         if self.lifecycleManager.isActive {
