@@ -300,6 +300,44 @@ extension Selector: _SelectorBackendProtocol {
             !self.pollFDs.isEmpty,
             "pollFDs should never be empty here, since we need an eventFD for waking up on demand"
         )
+        // Drop deregistered entries before polling. A socket deregistered
+        // since the last poll (by a task, or by the processing below) has
+        // usually been closed too, and Windows reuses handles at once — for
+        // a new socket, or any other kernel object. Polled, a closed handle
+        // comes back POLLNVAL, and one reused for something that isn't a
+        // socket fails the whole WSAPoll, which ends the event loop.
+        //
+        // A single linear in-place compaction pass: walk `pollFDs` once with
+        // a read/write cursor, dropping entries whose index is in
+        // `deregisteredFDs` and updating `pollFDIndexes` for any surviving
+        // entry that shifted left. This is O(n) and avoids both the previous
+        // `sorted(by: >)` (O(k log k)) and per-call `pollFDs.remove(at:)`
+        // (O(n) each, O(k·n) total).
+        //
+        // `registrations` isn't touched: `deregister` already removed the
+        // entry's registration, and one under the same handle now belongs
+        // to a newer socket that Windows gave the handle to.
+        //
+        // The wakeup socket is always at `pollFDs[0]` and is never registered
+        // in `pollFDIndexes`, so we treat index 0 as a fixed survivor.
+        if !self.deregisteredFDs.isEmpty {
+            var write = 0
+            for read in 0..<self.pollFDs.count {
+                if self.deregisteredFDs.contains(read) {
+                    continue
+                }
+                if write != read {
+                    self.pollFDs[write] = self.pollFDs[read]
+                    if write != 0 {
+                        self.pollFDIndexes[NIOBSDSocket.Handle(self.pollFDs[write].fd)] = write
+                    }
+                }
+                write += 1
+            }
+            self.pollFDs.removeLast(self.pollFDs.count - write)
+            self.deregisteredFDs.removeAll(keepingCapacity: true)
+        }
+
         // We always have at least the wakeup socket in pollFDs
         let result = self.pollFDs.withUnsafeMutableBufferPointer { ptr in
             WSAPoll(ptr.baseAddress!, UInt32(ptr.count), time)
@@ -326,6 +364,16 @@ extension Selector: _SelectorBackendProtocol {
                     continue
                 }
 
+                // Deregistered while processing this poll's events: the entry
+                // stays in `pollFDs` until the next poll, but its registration
+                // is gone, and Windows reuses socket handles at once — a
+                // socket registered since may have the same handle, and so
+                // the registration looked up below. These events aren't that
+                // socket's, so skip the entry.
+                if self.deregisteredFDs.contains(i) {
+                    continue
+                }
+
                 // If the registration is not in the Map anymore we deregistered it during the processing of whenReady(...). In this case just skip it.
                 guard let registration = self.registrations[Int(fd)] else {
                     continue
@@ -340,35 +388,6 @@ extension Selector: _SelectorBackendProtocol {
                 }
 
                 try body((SelectorEvent(io: selectorEvent, registration: registration)))
-            }
-
-            // Clean up any deregistered fds in a single linear in-place compaction
-            // pass: walk `pollFDs` once with a read/write cursor, dropping entries
-            // whose index is in `deregisteredFDs` and updating `pollFDIndexes`
-            // for any surviving entry that shifted left. This is O(n) and avoids
-            // both the previous `sorted(by: >)` (O(k log k)) and per-call
-            // `pollFDs.remove(at:)` (O(n) each, O(k·n) total).
-            //
-            // The wakeup socket is always at `pollFDs[0]` and is never registered
-            // in `pollFDIndexes`, so we treat index 0 as a fixed survivor.
-            if !self.deregisteredFDs.isEmpty {
-                var write = 0
-                for read in 0..<self.pollFDs.count {
-                    if self.deregisteredFDs.contains(read) {
-                        let fd = self.pollFDs[read].fd
-                        self.registrations.removeValue(forKey: Int(fd))
-                        continue
-                    }
-                    if write != read {
-                        self.pollFDs[write] = self.pollFDs[read]
-                        if write != 0 {
-                            self.pollFDIndexes[NIOBSDSocket.Handle(self.pollFDs[write].fd)] = write
-                        }
-                    }
-                    write += 1
-                }
-                self.pollFDs.removeLast(self.pollFDs.count - write)
-                self.deregisteredFDs.removeAll(keepingCapacity: true)
             }
         } else if result == 0 {
             // nothing has happened
